@@ -1,4 +1,4 @@
-# trace-denoise
+# DDTR: Diffusion Denoising Trace Recovery
 
 This is the implementation for the Diffusion Denoising Trace Recovery research.
 
