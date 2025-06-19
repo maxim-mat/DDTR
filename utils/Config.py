@@ -25,6 +25,7 @@ class Config:
     gamma: float = None
     matrix_type: str = "pm"
     activity_names: dict[int, str] = None
+    pad_token: int = None
     process_discovery_method: str = "inductive"
 
     def __post_init__(self):
@@ -32,3 +33,4 @@ class Config:
             self.conditional_dropout = 1.0
         if self.activity_names is not None:
             self.activity_names = {int(k): v for k, v in self.activity_names.items()}
+        self.pad_token = self.num_classes - 1

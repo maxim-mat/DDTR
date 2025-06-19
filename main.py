@@ -8,7 +8,7 @@ import plotly.express as px
 import torch
 import torch.nn as nn
 from scipy.stats import wasserstein_distance
-from sklearn.metrics import roc_auc_score, accuracy_score, precision_score, recall_score, f1_score
+import sklearn.metrics as metrics
 from sklearn.model_selection import train_test_split
 from tensorboardX import SummaryWriter
 from torch.optim import AdamW
@@ -39,7 +39,24 @@ def save_ckpt(model, opt, epoch, cfg, train_loss, test_loss, best=False):
         torch.save(ckpt, os.path.join(cfg.summary_path, 'best.ckpt'))
 
 
-def evaluate(diffuser, denoiser, test_loader, transition_matrix, cfg, summary, epoch, logger):
+def evaluate_batch(gt, predicted, cfg):
+    for dk_trace, dk_hat_trace in zip(gt, predicted):
+        dk_activities = torch.argmax(dk_trace, dim=0).cpu().numpy()
+        dk_hat_activities = torch.argmax(torch.softmax(dk_hat_trace, dim=1), dim=1).cpu().numpy()
+        accs = metrics.accuracy_score(dk_activities[dk_activities != cfg.pad_token],
+                                      dk_hat_activities[dk_activities != cfg.pad_token])
+        pres = metrics.precision_score(dk_activities[dk_activities != cfg.pad_token],
+                                       dk_hat_activities[dk_activities != cfg.pad_token], average='macro',
+                                       zero_division=0)
+        recs = metrics.recall_score(dk_activities[dk_activities != cfg.pad_token],
+                                    dk_hat_activities[dk_activities != cfg.pad_token], average='macro',
+                                    zero_division=0)
+        dists = wasserstein_distance(dk_activities[dk_activities != cfg.pad_token],
+                                     dk_hat_activities[dk_activities != cfg.pad_token])
+        return accs, pres, recs, dists
+
+
+def evaluate(diffuser, denoiser, test_loader, transition_matrix, cfg, summary, epoch):
     denoiser.eval()
     total_loss = 0.0
     sequence_loss = 0.0
@@ -64,50 +81,35 @@ def evaluate(diffuser, denoiser, test_loader, transition_matrix, cfg, summary, e
             summary.add_scalar("test_sequence_loss", seq_loss, global_step=epoch * l + i)
             summary.add_scalar("test_matrix_loss", mat_loss, global_step=epoch * l + i)
 
-        x_argmax = torch.argmax(torch.cat(results_accumulator['x'], dim=0), dim=1).to('cpu')
-        y_cat = torch.cat(results_accumulator['y'], dim=0)
-        x_hat_logit = torch.cat(results_accumulator['x_hat'], dim=0)
+        accs, pres, recs, dists = [], [], [], []
+        for x, x_hat in zip(results_accumulator['x'], results_accumulator['x_hat']):
+            batch_accs, batch_pres, batch_recs, batch_dists = evaluate_batch(x, x_hat, cfg)
+            accs.append(batch_accs)
+            pres.append(batch_pres)
+            recs.append(batch_recs)
+            dists.append(batch_dists)
 
-        x_argmax_flat = x_argmax.reshape(-1).to('cpu')
-        x_hat_flat = x_hat_logit.reshape(-1, cfg.num_classes).to('cpu')
-        x_hat_prob_flat = torch.softmax(x_hat_flat, dim=1).to('cpu')
-        x_hat_argmax_flat = torch.argmax(x_hat_prob_flat, dim=1).to('cpu')
-        x_hat_prob = torch.softmax(x_hat_logit, dim=2).to('cpu')
-        x_hat_argmax = torch.argmax(x_hat_prob, dim=2)  # recovered deterministic traces tensor
-
-        try:
-            auc = roc_auc_score(x_argmax_flat, x_hat_prob_flat, multi_class='ovr', average='macro')
-        except ValueError:
-            logger.debug("failed to calculate auc")
-            auc = -1
-
-        w2 = np.mean([wasserstein_distance(xi, xhi) for xi, xhi in zip(x_argmax, x_hat_argmax)])
-        accuracy = accuracy_score(x_argmax_flat, x_hat_argmax_flat)
-        precision = precision_score(x_argmax_flat, x_hat_argmax_flat, average='macro', zero_division=0)
-        recall = recall_score(x_argmax_flat, x_hat_argmax_flat, average='macro', zero_division=0)
-        f1 = f1_score(x_argmax_flat, x_hat_argmax_flat, average='macro', zero_division=0)
+        accuracy = np.mean(accs)
+        precision = np.mean(pres)
+        recall = np.mean(recs)
+        w2 = np.mean(dists)
         average_loss = total_loss / l
         average_first_loss = sequence_loss / l
         average_second_loss = matrix_loss / l
-        with open(os.path.join(cfg.summary_path, f"epoch_{epoch}_test.pkl"), "wb") as f:
-            pkl.dump(results_accumulator, f)
 
         summary.add_scalar("test_w2", w2, global_step=epoch * l)
         summary.add_scalar("test_accuracy", accuracy, global_step=epoch * l)
         summary.add_scalar("test_recall", recall, global_step=epoch * l)
         summary.add_scalar("test_precision", precision, global_step=epoch * l)
-        summary.add_scalar("test_f1", f1, global_step=epoch * l)
-        summary.add_scalar("test_auc", auc, global_step=epoch * l)
         summary.add_scalar("test_alpha", denoiser.alpha, global_step=epoch * l)
         denoiser.train()
-    return average_loss, accuracy, recall, precision, f1, auc, w2, average_first_loss, average_second_loss, \
+    return average_loss, accuracy, recall, precision, w2, average_first_loss, average_second_loss, \
         denoiser.alpha
 
 
 def train(diffuser, denoiser, optimizer, train_loader, test_loader, transition_matrix, cfg, summary, logger):
-    train_losses, test_losses, test_dist, test_acc, test_precision, test_recall, test_f1, test_auc = \
-        [], [], [], [], [], [], [], []
-    train_dist, train_acc, train_precision, train_recall, train_f1, train_auc = [], [], [], [], [], []
+    test_losses, test_dist, test_acc, test_precision, test_recall = [], [], [], [], []
+    train_losses, train_dist, train_acc, train_precision, train_recall = [], [], [], [], []
     train_seq_loss, train_matrix_loss, test_seq_loss, test_matrix_loss = [], [], [], []
     train_alpha, test_alpha = [], []
     l = len(train_loader)
@@ -163,53 +165,37 @@ def train(diffuser, denoiser, optimizer, train_loader, test_loader, transition_m
                         diffuser.sample_with_matrix(denoiser, y.shape[0], cfg.num_classes, denoiser.max_input_dim,
                                                     transition_matrix.shape[-1], transition_matrix, x, y,
                                                     cfg.predict_on)
-                    x_hat = output.permute(0, 2, 1)
-                    x_argmax = torch.argmax(x, dim=1).to('cpu')
-                    x_argmax_flat = torch.argmax(x, dim=1).reshape(-1).to('cpu')
-                    x_hat_flat = x_hat.reshape(-1, cfg.num_classes).to('cpu')
-                    x_hat_prob_flat = torch.softmax(x_hat_flat, dim=1).to('cpu')
-                    x_hat_argmax_flat = torch.argmax(x_hat_prob_flat, dim=1).to('cpu')
-                    x_hat_prob = torch.softmax(x_hat, dim=2).to('cpu')
-                    x_hat_argmax = torch.argmax(x_hat_prob, dim=2)
-                    try:
-                        auc = roc_auc_score(x_argmax_flat, x_hat_prob_flat, multi_class='ovr', average='micro')
-                    except ValueError:
-                        logger.info("excuse me wtf")
-                        auc = -1
-                        with open(os.path.join(cfg.summary_path, f"train_epoch_{epoch}_auc_error.pkl"), "wb") as f:
-                            pkl.dump({"x_argmax_flat": x_argmax_flat, "x_hat_prob_flat": x_hat_prob_flat}, f)
-                    w2 = np.mean([wasserstein_distance(xi, xhi) for xi, xhi in zip(x_argmax, x_hat_argmax)])
-                    accuracy = accuracy_score(x_argmax_flat, x_hat_argmax_flat)
-                    precision = precision_score(x_argmax_flat, x_hat_argmax_flat, average='macro', zero_division=0)
-                    recall = recall_score(x_argmax_flat, x_hat_argmax_flat, average='macro', zero_division=0)
-                    f1 = f1_score(x_argmax_flat, x_hat_argmax_flat, average='macro', zero_division=0)
-                    with open(os.path.join(cfg.summary_path, f"epoch_{epoch}_train.pkl"), "wb") as f:
-                        pkl.dump({"x": x, y: "y", "x_hat": x_hat}, f)
+
+                    accs, pres, recs, dists = [], [], [], []
+                    batch_accs, batch_pres, batch_recs, batch_dists = evaluate_batch(x, output.permute(0, 2, 1), cfg)
+                    accs.append(batch_accs)
+                    pres.append(batch_pres)
+                    recs.append(batch_recs)
+                    dists.append(batch_dists)
+
+                    accuracy = np.mean(accs)
+                    precision = np.mean(pres)
+                    recall = np.mean(recs)
+                    w2 = np.mean(dists)
                     train_acc.append(accuracy)
                     train_recall.append(recall)
                     train_precision.append(precision)
-                    train_f1.append(f1)
-                    train_auc.append(auc)
                     train_dist.append(w2)
                     summary.add_scalar("train_w2", w2, global_step=epoch * l)
                     summary.add_scalar("train_accuracy", accuracy, global_step=epoch * l)
                     summary.add_scalar("train_recall", recall, global_step=epoch * l)
                     summary.add_scalar("train_precision", precision, global_step=epoch * l)
-                    summary.add_scalar("train_f1", f1, global_step=epoch * l)
-                    summary.add_scalar("train_auc", auc, global_step=epoch * l)
                     summary.add_scalar("train_alpha", denoiser.alpha, global_step=epoch * l)
                 denoiser.train()
 
-            test_epoch_loss, test_epoch_acc, test_epoch_recall, test_epoch_precision, test_epoch_f1, test_epoch_auc, \
+            test_epoch_loss, test_epoch_acc, test_epoch_recall, test_epoch_precision, \
                 test_epoch_dist, test_epoch_seq_loss, test_epoch_mat_loss, test_alpha_clamp = \
-                evaluate(diffuser, denoiser, test_loader, transition_matrix, cfg, summary, epoch, logger)
+                evaluate(diffuser, denoiser, test_loader, transition_matrix, cfg, summary, epoch)
             test_dist.append(test_epoch_dist)
             test_losses.append(test_epoch_loss)
             test_acc.append(test_epoch_acc)
             test_recall.append(test_epoch_recall)
             test_precision.append(test_epoch_precision)
-            test_f1.append(test_epoch_f1)
-            test_auc.append(test_epoch_auc)
             test_seq_loss.append(test_epoch_seq_loss)
             test_matrix_loss.append(test_epoch_mat_loss)
             test_alpha.append(test_alpha_clamp)
@@ -218,8 +204,8 @@ def train(diffuser, denoiser, optimizer, train_loader, test_loader, transition_m
                       test_epoch_loss < best_loss)
             best_loss = test_epoch_loss if test_epoch_loss < best_loss else best_loss
 
-    return (train_losses, test_losses, test_dist, test_acc, test_precision, test_recall, test_f1, test_auc,
-            train_acc, train_recall, train_precision, train_f1, train_auc, train_dist, train_seq_loss,
+    return (train_losses, test_losses, test_dist, test_acc, test_precision, test_recall,
+            train_acc, train_recall, train_precision, train_dist, train_seq_loss,
             train_matrix_loss, test_seq_loss, test_matrix_loss, train_alpha, test_alpha)
 
 
@@ -277,8 +263,8 @@ def main():
     optimizer = AdamW(denoiser.parameters(), cfg.learning_rate)
     summary = SummaryWriter(cfg.summary_path)
 
-    (train_losses, test_losses, test_dist, test_acc, test_precision, tests_recall, test_f1, test_auc, train_acc,
-     train_recall, train_precision, train_f1, train_auc, train_dist, train_seq_loss, train_mat_loss, test_seq_loss,
+    (train_losses, test_losses, test_dist, test_acc, test_precision, tests_recall, train_acc,
+     train_recall, train_precision, train_dist, train_seq_loss, train_mat_loss, test_seq_loss,
      test_mat_loss, train_alpha, test_alpha) = \
         train(diffuser, denoiser, optimizer, train_loader, test_loader, rg_transition_matrix, cfg, summary, logger)
 
@@ -288,13 +274,9 @@ def main():
     px.line(test_acc).write_html(os.path.join(cfg.summary_path, "test_acc.html"))
     px.line(test_precision).write_html(os.path.join(cfg.summary_path, "test_precision.html"))
     px.line(tests_recall).write_html(os.path.join(cfg.summary_path, "test_recall.html"))
-    px.line(test_f1).write_html(os.path.join(cfg.summary_path, "test_f1.html"))
-    px.line(test_auc).write_html(os.path.join(cfg.summary_path, "test_auc.html"))
     px.line(train_acc).write_html(os.path.join(cfg.summary_path, "train_acc.html"))
     px.line(train_recall).write_html(os.path.join(cfg.summary_path, "train_recall.html"))
     px.line(train_precision).write_html(os.path.join(cfg.summary_path, "train_precision.html"))
-    px.line(train_f1).write_html(os.path.join(cfg.summary_path, "train_f1.html"))
-    px.line(train_auc).write_html(os.path.join(cfg.summary_path, "train_auc.html"))
     px.line(train_dist).write_html(os.path.join(cfg.summary_path, "train_dist.html"))
     px.line(train_seq_loss).write_html(os.path.join(cfg.summary_path, "train_seq_loss.html"))
     px.line(train_mat_loss).write_html(os.path.join(cfg.summary_path, "train_mat_loss.html"))
@@ -310,8 +292,6 @@ def main():
                 "acc": train_acc[-1],
                 "precision": train_precision[-1],
                 "recall": train_recall[-1],
-                "f1": train_f1[-1],
-                "auc": train_auc[-1],
                 "dist": train_dist[-1]
             },
         "test":
@@ -320,8 +300,6 @@ def main():
                 "acc": test_acc[-1],
                 "precision": test_precision[-1],
                 "recall": tests_recall[-1],
-                "f1": test_f1[-1],
-                "auc": test_auc[-1],
                 "dist": test_dist[-1]
             }
     }
